@@ -1,0 +1,403 @@
+#include <memory>
+#include <chrono>
+#include <string>
+#include <Eigen/Dense>
+
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "nav_msgs/msg/path.hpp"
+
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/registration/icp.h>
+#include <pcl_conversions/pcl_conversions.h>
+
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+
+
+namespace ph = std::placeholders;
+
+class IcpNode : public rclcpp::Node
+{
+public:
+  IcpNode()// 构造函数创建节点
+  : Node("icp_node")  
+  , leaf_size_(declare_parameter<double>("voxel_leaf_size", 0.2)) // 用于体素降采样的叶大小（米）
+  , max_corresp_dist_(declare_parameter<double>("max_correspondence_dist", 2.0))  // ICP 中对应点最大距离阈值
+  , max_iter_(declare_parameter<int>("max_iterations", 50))  // ICP 算法最大迭代次数
+  , trans_eps_(declare_parameter<double>("transformation_epsilon", 1e-6))  // 变换收敛阈值
+  , euclid_fitness_eps_(declare_parameter<double>("euclidean_fitness_epsilon", 1e-6))  // 欧几里得适应度收敛阈值
+  {
+    world_frame_ = this->declare_parameter<std::string>("world_frame", "map");
+    lidar_frame_ = this->declare_parameter<std::string>("lidar_frame", "rslidar");
+
+    // 订阅 bag 播放出的点云
+    std::string topic = declare_parameter<std::string>("topic", "/delphin_m1p_points"); 
+    sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(   
+      topic, rclcpp::SensorDataQoS(),                               // 使用 SensorDataQoS() 服务质量策略（适用于传感器数据）
+      std::bind(&IcpNode::cloudCallback, this, ph::_1));            // 绑定回调函数 cloudCallback，当收到消息时调用该函数处理
+
+    // 发布对齐后的点云和累计位姿
+    pub_aligned_ = create_publisher<sensor_msgs::msg::PointCloud2>("/icp/aligned_points", 10);  
+    pub_pose_    = create_publisher<geometry_msgs::msg::PoseStamped>("/icp/pose", 10);  
+    pub_path_   = this->create_publisher<nav_msgs::msg::Path>("icp_path", 10);
+
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
+
+    path_msg_.header.frame_id = world_frame_;  
+
+    // 累计位姿（世界坐标）初始化为单位矩阵
+    T_world_curr_.setIdentity();  
+
+    RCLCPP_INFO(get_logger(), "ICP node started. Subscribing: %s", topic.c_str());  
+  }
+
+private:
+  using CloudT = pcl::PointCloud<pcl::PointXYZ>;
+
+
+    // 点云回调函数
+  void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+  {
+    //RCLCPP_INFO(get_logger(), "cloudCallback");   
+
+    
+    // 转为 PCL 并降采样
+    CloudT::Ptr curr_raw = toPclXYZ(*msg);
+    if (curr_raw->empty()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Empty cloud, skip.");
+      return;
+    }
+    CloudT::Ptr curr = voxelDownsample(curr_raw, leaf_size_);
+
+    //RCLCPP_INFO(get_logger(), "cloudCallback74");   
+    // 第一帧只缓存，不做配准
+    if (!prev_) {
+      prev_ = curr;
+      T_world_curr_.setIdentity();  // world->rslidar = I
+
+      //RCLCPP_INFO(get_logger(), "cloudCallback81");   
+      // 广播 TF: world_frame_ -> lidar_frame_（用bag的时间戳）
+      auto tf0 = eigMatToTf(T_world_curr_, world_frame_, lidar_frame_, msg->header.stamp);
+      tf_broadcaster_->sendTransform(tf0);
+
+      // 初始化 Path，并发布初始位姿（可视化起点）
+      path_msg_.header.frame_id = world_frame_;
+      path_msg_.header.stamp = msg->header.stamp;
+      path_msg_.poses.clear();
+
+      //RCLCPP_INFO(get_logger(), "cloudCallback91");   
+      geometry_msgs::msg::PoseStamped ps0;
+      ps0.header.frame_id = world_frame_;
+      ps0.header.stamp = msg->header.stamp;
+      matToPose(T_world_curr_, ps0.pose);                  // 需要: Eigen 4x4 -> geometry_msgs::Pose
+      //RCLCPP_INFO(get_logger(), "cloudCallback96");   
+      path_msg_.poses.push_back(ps0);
+      //RCLCPP_INFO(get_logger(), "cloudCallback98");   
+      pub_path_->publish(path_msg_);
+
+      //RCLCPP_INFO(get_logger(), "cloudCallback100");   
+
+      /*
+      // 将当前帧（未对齐）直接作为aligned发布，frame_id 仍为 rslidar
+      sensor_msgs::msg::PointCloud2 out0;
+      pcl::toROSMsg(*curr, out0);
+      out0.header = msg->header;
+      out0.header.frame_id = lidar_frame_;
+      pub_aligned_->publish(out0);
+      return;
+      */
+
+      /*
+      last_stamp_ = msg->header.stamp;
+      RCLCPP_INFO(get_logger(), "Received first cloud: %zu points (downsampled).", curr->size());
+      publishAlignedAndPose(*curr, msg->header.frame_id, msg->header.stamp, true);
+      return;
+      */
+    }
+
+    //RCLCPP_INFO(get_logger(), "cloudCallback112");   
+    // 3) ICP: source=curr, target=prev_
+    Eigen::Matrix4f T_prev_curr;
+    CloudT aligned;   // 对齐到 "prev_" 坐标系（即 rslidar）的点云，仅用于可视化
+    try {
+        // 打印输入点云大小
+         RCLCPP_INFO(this->get_logger(),
+              "ICP start: source pts=%zu, target pts=%zu, "
+              "max_corr=%.2f, max_iter=%d, trans_eps=%.1e, fit_eps=%.1e",
+              curr->size(), prev_ ? prev_->size() : 0,
+              max_corresp_dist_, max_iter_,
+              trans_eps_, euclid_fitness_eps_);
+
+      // 设置 ICP 参数并执行 icp.align(aligned)
+      T_prev_curr = runICP(curr, prev_, &aligned,
+                          max_corresp_dist_, max_iter_,
+                          trans_eps_, euclid_fitness_eps_);
+    } catch (const std::exception &e) {
+      RCLCPP_WARN(this->get_logger(), "ICP failed: %s. Keep last pose.", e.what());
+
+      // 失败也广播一次TF，保证RViz不报 TF 断链
+      auto tf_keep = eigMatToTf(T_world_curr_, world_frame_, lidar_frame_, msg->header.stamp);
+      tf_broadcaster_->sendTransform(tf_keep);
+
+      //仍发布当前帧为 aligned（未对齐）
+      sensor_msgs::msg::PointCloud2 out_fail;
+      pcl::toROSMsg(*curr, out_fail);
+      out_fail.header = msg->header;
+      out_fail.header.frame_id = lidar_frame_;
+      pub_aligned_->publish(out_fail);
+
+      prev_ = curr;  // 滚动参考
+      return;
+    }
+
+    
+
+    /* 
+    // 设置 ICP
+    pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+    icp.setInputSource(curr);     // 当前帧
+    icp.setInputTarget(prev_);    // 目标为上一帧
+    icp.setMaxCorrespondenceDistance(max_corresp_dist_);  //最大对应点距离
+    icp.setMaximumIterations(max_iter_);                  //最大迭代次数
+    icp.setTransformationEpsilon(trans_eps_);              // 变换收敛阈值
+    icp.setEuclideanFitnessEpsilon(euclid_fitness_eps_);    // 欧几里得适应度收敛阈值
+
+    icp.align(aligned); // 执行配准
+
+    bool converged = icp.hasConverged();    // 是否收敛
+    double fitness = icp.getFitnessScore(); //配准质量 适应度得分
+    int iters = icp.getMaximumIterations(); // 注意：返回的是设定值，实际迭代步数 PCL 没有直接 API 获取
+
+    if (!converged) {
+      RCLCPP_WARN(get_logger(), "ICP did not converge. Fitness=%.6f", fitness);
+      // 即便不收敛，也可以继续用上一帧作为参考，或者直接更新 prev_ 以推进
+      prev_ = curr;
+      publishAlignedAndPose(*curr, msg->header.frame_id, msg->header.stamp, true);
+      return;
+    }
+    */
+
+    // 累计到世界位姿： T_world_curr = T_world_prev * T_prev_curr
+    T_world_curr_ = T_world_curr_ * T_prev_curr;
+
+    // 5) 广播 TF: world_frame_ -> lidar_frame_（核心：让RViz能把所有坐标系放一起）
+    auto tf_msg = eigMatToTf(T_world_curr_, world_frame_, lidar_frame_, msg->header.stamp);
+    tf_broadcaster_->sendTransform(tf_msg);
+
+    RCLCPP_INFO(get_logger(), "ICP node started pub");    
+
+    // 6) 发布 PoseStamped + Path（header.frame_id 必须是 world_frame_）
+    geometry_msgs::msg::PoseStamped ps;
+    ps.header.frame_id = world_frame_;
+    ps.header.stamp = msg->header.stamp;
+    matToPose(T_world_curr_, ps.pose);
+
+    path_msg_.header.frame_id = world_frame_;
+    path_msg_.header.stamp = ps.header.stamp;
+    path_msg_.poses.push_back(ps);
+    pub_path_->publish(path_msg_);
+
+    // 7) （可选）发布对齐后的点云（仍然在 rslidar 坐标系，RViz 会用TF变到 map）
+    sensor_msgs::msg::PointCloud2 out;
+    pcl::toROSMsg(aligned, out);
+    out.header = msg->header;
+    out.header.frame_id = lidar_frame_;  // 和 bag 一致，方便TF统一管理
+    pub_aligned_->publish(out);
+
+    // 8) 滚动参考
+    prev_ = curr;
+
+    /* 
+    RCLCPP_INFO(get_logger(),
+      "ICP converged: fitness=%.6f, iterations<=%d | trans = [%.3f %.3f %.3f]",
+      fitness, iters, T_prev_curr(0,3), T_prev_curr(1,3), T_prev_curr(2,3));
+
+    // 发布对齐后的点云（已经在上一帧坐标系下）
+    sensor_msgs::msg::PointCloud2 out_msg;
+    pcl::toROSMsg(aligned, out_msg);
+    out_msg.header.frame_id = msg->header.frame_id; // 用同一 frame_id，表示上一帧坐标系
+    out_msg.header.stamp = msg->header.stamp;
+    pub_aligned_->publish(out_msg);
+
+    // 发布累计位姿（世界坐标系下）
+    publishPose(msg->header.frame_id, msg->header.stamp, T_world_curr_);
+
+    // 更新缓存为当前帧（作为下一帧的 target）
+    prev_ = curr;
+    last_stamp_ = msg->header.stamp;
+    */
+  }
+
+  //将ROS的sensor_msgs::msg::PointCloud2转换为PCL点云格式
+  static CloudT::Ptr toPclXYZ(const sensor_msgs::msg::PointCloud2 & msg)
+  {
+    pcl::PCLPointCloud2 pcl_pc2;
+    pcl_conversions::toPCL(msg, pcl_pc2);//将ROS的sensor_msgs::PointCloud2消息转换为PCL的PCLPointCloud2格式。
+    CloudT::Ptr cloud(new CloudT);
+    pcl::fromPCLPointCloud2(pcl_pc2, *cloud); //将PCLPointCloud2格式的数据转换为PointCloudpcl::PointXYZ格式，存储在cloud对象中。
+    // 去掉 NaN
+    std::vector<int> idx;
+    pcl::removeNaNFromPointCloud(*cloud, *cloud, idx);
+    return cloud;
+  }
+
+  // 体素降采样
+  CloudT::Ptr voxelDownsample(const CloudT::Ptr & in, double leaf)
+  {
+    if (leaf <= 0.0) return in;
+    pcl::VoxelGrid<pcl::PointXYZ> vg;
+    vg.setInputCloud(in);
+    vg.setLeafSize(leaf, leaf, leaf);
+    CloudT::Ptr out(new CloudT);
+    vg.filter(*out);
+    return out;
+  }
+
+
+
+  //用于发布对齐后的点云和位姿
+  void publishAlignedAndPose(const CloudT & cloud,
+                             const std::string & frame_id,
+                             const rclcpp::Time & stamp,
+                             bool keep_pose_identity)
+  {
+    sensor_msgs::msg::PointCloud2 out;
+    pcl::toROSMsg(cloud, out); //将PCL点云格式转换为ROS PointCloud2消息格式。
+    out.header.frame_id = frame_id;
+    out.header.stamp = stamp;
+    pub_aligned_->publish(out);
+
+    if (keep_pose_identity) {
+      publishPose(frame_id, stamp, T_world_curr_); // 初始为 I
+    }
+  }
+
+  // 将 4x4 变换矩阵转换为 ROS Pose
+  static void matToPose(const Eigen::Matrix4f & T,
+                        geometry_msgs::msg::Pose & pose)
+  {   
+    Eigen::Matrix3f R = T.block<3,3>(0,0); //从4x4变换矩阵T中提取左上角3x3的旋转子矩阵，存储在R中。
+    Eigen::Quaternionf q(R);  
+    q.normalize();//对四元数进行归一化处理，确保其为单位四元数。
+    pose.position.x = T(0,3);
+    pose.position.y = T(1,3);
+    pose.position.z = T(2,3);
+    pose.orientation.x = q.x();
+    pose.orientation.y = q.y();
+    pose.orientation.z = q.z();
+    pose.orientation.w = q.w();
+  }
+
+  static geometry_msgs::msg::TransformStamped
+  eigMatToTf(const Eigen::Matrix4f &T, const std::string &parent, const std::string &child,
+           const rclcpp::Time &stamp)
+  {
+    Eigen::Matrix3f R = T.block<3,3>(0,0);
+    Eigen::Vector3f t = T.block<3,1>(0,3);
+    Eigen::Quaternionf q(R);
+    q.normalize();
+
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp = stamp;          // 用 bag 的时间 /clock
+    tf.header.frame_id = parent;      // world_frame_
+    tf.child_frame_id = child;        // lidar_frame_
+    tf.transform.translation.x = t.x();
+    tf.transform.translation.y = t.y();
+    tf.transform.translation.z = t.z();
+    tf.transform.rotation.x = q.x();
+    tf.transform.rotation.y = q.y();
+    tf.transform.rotation.z = q.z();
+    tf.transform.rotation.w = q.w();
+    return tf;
+  }
+
+  Eigen::Matrix4f runICP(const CloudT::Ptr & source,
+                       const CloudT::Ptr & target,
+                       CloudT *aligned_out,
+                       double max_corr,
+                       int max_iter,
+                       double trans_eps,
+                       double fit_eps)
+  {
+    pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+    icp.setInputSource(source);
+    icp.setInputTarget(target);
+    icp.setMaxCorrespondenceDistance(max_corr);
+    icp.setMaximumIterations(max_iter);
+    icp.setTransformationEpsilon(trans_eps);
+    icp.setEuclideanFitnessEpsilon(fit_eps);
+
+    CloudT aligned_tmp;
+    icp.align(aligned_tmp);
+
+    if (aligned_out) {
+      *aligned_out = aligned_tmp;
+    }
+
+    if (!icp.hasConverged()) {
+      throw std::runtime_error("ICP did not converge");
+    }
+
+    return icp.getFinalTransformation();
+  }
+
+
+  // 发布位姿和路径
+  void publishPose(const std::string & frame_id,
+                   const rclcpp::Time & stamp,
+                   const Eigen::Matrix4f & T_world_curr)
+  {
+    geometry_msgs::msg::PoseStamped ps;
+    
+    ps.header.stamp = stamp;
+    ps.header.frame_id = "rslidar"; // 这里简单用点云 frame，当作“世界”坐标系
+    matToPose(T_world_curr, ps.pose);
+
+    //发布单帧 pose
+    pub_pose_->publish(ps);
+
+    // 累加到 path
+    path_msg_.header.stamp = stamp;
+    path_msg_.poses.push_back(ps);
+    pub_path_->publish(path_msg_);
+  }
+
+private:
+  // 参数
+  double leaf_size_;
+  double max_corresp_dist_;
+  int    max_iter_;
+  double trans_eps_;
+  double euclid_fitness_eps_;
+
+  // 订阅 / 发布
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_aligned_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
+  nav_msgs::msg::Path path_msg_;
+
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::string world_frame_ = "map";   // "map"
+  std::string lidar_frame_ = "rslidar";   // "rslidar"
+
+  // 上一帧点云与时间戳
+  CloudT::Ptr prev_;
+  rclcpp::Time last_stamp_;
+
+  // 累计世界位姿
+  Eigen::Matrix4f T_world_curr_;
+};
+
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<IcpNode>());
+  std::cout << "IcpNode shutdown" << std::endl;
+  rclcpp::shutdown();
+  return 0;
+}
