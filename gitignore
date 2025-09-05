@@ -1,0 +1,7 @@
+# 忽略 rosbag2 录包文件
+/rosbag2_*
+*.db3
+# 忽略 ROS2 编译生成目录`
+/build/
+/install/
+/log/
