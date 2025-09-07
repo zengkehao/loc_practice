@@ -62,7 +62,6 @@ private:
     // 点云回调函数
   void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
-    //RCLCPP_INFO(get_logger(), "cloudCallback");   
 
     
     // 转为 PCL 并降采样
@@ -72,14 +71,12 @@ private:
       return;
     }
     CloudT::Ptr curr = voxelDownsample(curr_raw, leaf_size_);
-
-    //RCLCPP_INFO(get_logger(), "cloudCallback74");   
+  
     // 第一帧只缓存，不做配准
     if (!prev_) {
       prev_ = curr;
       T_world_curr_.setIdentity();  // world->rslidar = I
 
-      //RCLCPP_INFO(get_logger(), "cloudCallback81");   
       // 广播 TF: world_frame_ -> lidar_frame_（用bag的时间戳）
       auto tf0 = eigMatToTf(T_world_curr_, world_frame_, lidar_frame_, msg->header.stamp);
       tf_broadcaster_->sendTransform(tf0);
@@ -88,38 +85,15 @@ private:
       path_msg_.header.frame_id = world_frame_;
       path_msg_.header.stamp = msg->header.stamp;
       path_msg_.poses.clear();
-
-      //RCLCPP_INFO(get_logger(), "cloudCallback91");   
+ 
       geometry_msgs::msg::PoseStamped ps0;
       ps0.header.frame_id = world_frame_;
       ps0.header.stamp = msg->header.stamp;
       matToPose(T_world_curr_, ps0.pose);                  // 需要: Eigen 4x4 -> geometry_msgs::Pose
-      //RCLCPP_INFO(get_logger(), "cloudCallback96");   
       path_msg_.poses.push_back(ps0);
-      //RCLCPP_INFO(get_logger(), "cloudCallback98");   
       pub_path_->publish(path_msg_);
-
-      //RCLCPP_INFO(get_logger(), "cloudCallback100");   
-
-      /*
-      // 将当前帧（未对齐）直接作为aligned发布，frame_id 仍为 rslidar
-      sensor_msgs::msg::PointCloud2 out0;
-      pcl::toROSMsg(*curr, out0);
-      out0.header = msg->header;
-      out0.header.frame_id = lidar_frame_;
-      pub_aligned_->publish(out0);
-      return;
-      */
-
-      /*
-      last_stamp_ = msg->header.stamp;
-      RCLCPP_INFO(get_logger(), "Received first cloud: %zu points (downsampled).", curr->size());
-      publishAlignedAndPose(*curr, msg->header.frame_id, msg->header.stamp, true);
-      return;
-      */
     }
 
-    //RCLCPP_INFO(get_logger(), "cloudCallback112");   
     // 3) ICP: source=curr, target=prev_
     Eigen::Matrix4f T_prev_curr;
     CloudT aligned;   // 对齐到 "prev_" 坐标系（即 rslidar）的点云，仅用于可视化
@@ -154,32 +128,6 @@ private:
       return;
     }
 
-    
-
-    /* 
-    // 设置 ICP
-    pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
-    icp.setInputSource(curr);     // 当前帧
-    icp.setInputTarget(prev_);    // 目标为上一帧
-    icp.setMaxCorrespondenceDistance(max_corresp_dist_);  //最大对应点距离
-    icp.setMaximumIterations(max_iter_);                  //最大迭代次数
-    icp.setTransformationEpsilon(trans_eps_);              // 变换收敛阈值
-    icp.setEuclideanFitnessEpsilon(euclid_fitness_eps_);    // 欧几里得适应度收敛阈值
-
-    icp.align(aligned); // 执行配准
-
-    bool converged = icp.hasConverged();    // 是否收敛
-    double fitness = icp.getFitnessScore(); //配准质量 适应度得分
-    int iters = icp.getMaximumIterations(); // 注意：返回的是设定值，实际迭代步数 PCL 没有直接 API 获取
-
-    if (!converged) {
-      RCLCPP_WARN(get_logger(), "ICP did not converge. Fitness=%.6f", fitness);
-      // 即便不收敛，也可以继续用上一帧作为参考，或者直接更新 prev_ 以推进
-      prev_ = curr;
-      publishAlignedAndPose(*curr, msg->header.frame_id, msg->header.stamp, true);
-      return;
-    }
-    */
 
     // 累计到世界位姿： T_world_curr = T_world_prev * T_prev_curr
     T_world_curr_ = T_world_curr_ * T_prev_curr;
@@ -210,26 +158,6 @@ private:
 
     // 8) 滚动参考
     prev_ = curr;
-
-    /* 
-    RCLCPP_INFO(get_logger(),
-      "ICP converged: fitness=%.6f, iterations<=%d | trans = [%.3f %.3f %.3f]",
-      fitness, iters, T_prev_curr(0,3), T_prev_curr(1,3), T_prev_curr(2,3));
-
-    // 发布对齐后的点云（已经在上一帧坐标系下）
-    sensor_msgs::msg::PointCloud2 out_msg;
-    pcl::toROSMsg(aligned, out_msg);
-    out_msg.header.frame_id = msg->header.frame_id; // 用同一 frame_id，表示上一帧坐标系
-    out_msg.header.stamp = msg->header.stamp;
-    pub_aligned_->publish(out_msg);
-
-    // 发布累计位姿（世界坐标系下）
-    publishPose(msg->header.frame_id, msg->header.stamp, T_world_curr_);
-
-    // 更新缓存为当前帧（作为下一帧的 target）
-    prev_ = curr;
-    last_stamp_ = msg->header.stamp;
-    */
   }
 
   //将ROS的sensor_msgs::msg::PointCloud2转换为PCL点云格式
