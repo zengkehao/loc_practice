@@ -13,6 +13,7 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/registration/icp.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl/filters/passthrough.h>   
 
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -31,8 +32,13 @@ public:
   , trans_eps_(declare_parameter<double>("transformation_epsilon", 1e-6))  // 变换收敛阈值
   , euclid_fitness_eps_(declare_parameter<double>("euclidean_fitness_epsilon", 1e-6))  // 欧几里得适应度收敛阈值
   {
-    world_frame_ = this->declare_parameter<std::string>("world_frame", "map");
-    lidar_frame_ = this->declare_parameter<std::string>("lidar_frame", "rslidar");
+    world_frame_  = this->declare_parameter<std::string>("world_frame", "map");
+    lidar_frame_  = this->declare_parameter<std::string>("lidar_frame", "rslidar");
+    z_min_        = this->declare_parameter<double>("z_min", -1.5);
+    z_max_        = this->declare_parameter<double>("z_max",  1.5);
+    use_z_weight_ = this->declare_parameter<bool>  ("use_z_weight", false); // 是否启用 z 降权
+    z_weight_     = this->declare_parameter<double>("z_weight", 0.10);      // z 权重 (<1 降权)
+
 
     // 订阅 bag 播放出的点云
     std::string topic = declare_parameter<std::string>("topic", "/delphin_m1p_points"); 
@@ -70,8 +76,10 @@ private:
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Empty cloud, skip.");
       return;
     }
-    CloudT::Ptr curr = voxelDownsample(curr_raw, leaf_size_);
-  
+
+    //CloudT::Ptr curr = voxelDownsample(curr_raw, leaf_size_);
+    // 过滤：高度窗口 + 体素
+    CloudT::Ptr curr = filterCloud(curr_raw, static_cast<float>(leaf_size_), z_min_, z_max_); 
     // 第一帧只缓存，不做配准
     if (!prev_) {
       prev_ = curr;
@@ -89,9 +97,22 @@ private:
       geometry_msgs::msg::PoseStamped ps0;
       ps0.header.frame_id = world_frame_;
       ps0.header.stamp = msg->header.stamp;
-      matToPose(T_world_curr_, ps0.pose);                  // 需要: Eigen 4x4 -> geometry_msgs::Pose
+      matToPoseSE2(T_world_curr_, ps0.pose);                  // 需要: Eigen 4x4 -> geometry_msgs::Pose
       path_msg_.poses.push_back(ps0);
       pub_path_->publish(path_msg_);
+
+      return;
+    }
+
+    // z 降权：把源/目标都缩放到 z_weight_ 域内做 ICP
+    CloudT::Ptr src = curr, tgt = prev_;
+    float z_scale = 1.0f;
+    if (use_z_weight_) {
+      z_scale = static_cast<float>(z_weight_);
+      src = boost::make_shared<CloudT>(*curr);
+      tgt = boost::make_shared<CloudT>(*prev_);
+      scaleCloudZ(src, z_scale);
+      scaleCloudZ(tgt, z_scale);
     }
 
     // 3) ICP: source=curr, target=prev_
@@ -107,7 +128,7 @@ private:
               trans_eps_, euclid_fitness_eps_);
 
       // 设置 ICP 参数并执行 icp.align(aligned)
-      T_prev_curr = runICP(curr, prev_, &aligned,
+      T_prev_curr = runICP(src, tgt, &aligned,
                           max_corresp_dist_, max_iter_,
                           trans_eps_, euclid_fitness_eps_);
     } catch (const std::exception &e) {
@@ -117,17 +138,29 @@ private:
       auto tf_keep = eigMatToTf(T_world_curr_, world_frame_, lidar_frame_, msg->header.stamp);
       tf_broadcaster_->sendTransform(tf_keep);
 
-      //仍发布当前帧为 aligned（未对齐）
-      sensor_msgs::msg::PointCloud2 out_fail;
-      pcl::toROSMsg(*curr, out_fail);
-      out_fail.header = msg->header;
-      out_fail.header.frame_id = lidar_frame_;
-      pub_aligned_->publish(out_fail);
+      pub_path_->publish(path_msg_);
+      return;
 
-      prev_ = curr;  // 滚动参考
+      // //仍发布当前帧为 aligned（未对齐）
+      // sensor_msgs::msg::PointCloud2 out_fail;
+      // pcl::toROSMsg(*curr, out_fail);
+      // out_fail.header = msg->header;
+      // out_fail.header.frame_id = lidar_frame_;
+      // pub_aligned_->publish(out_fail);
+
+      // prev_ = curr;  // 滚动参考
       return;
     }
 
+    // 若做了 z 降权：T = S^{-1} * T_scaled * S
+    if (use_z_weight_) {
+      Eigen::Matrix4f S = Eigen::Matrix4f::Identity();  S(2,2) = z_scale;
+      Eigen::Matrix4f S_inv = Eigen::Matrix4f::Identity(); S_inv(2,2) = 1.0f / z_scale;
+      T_prev_curr = S_inv * T_prev_curr * S;
+    }
+
+    // === 只保留 SE(2) ===
+    projectToSE2(T_prev_curr);
 
     // 累计到世界位姿： T_world_curr = T_world_prev * T_prev_curr
     T_world_curr_ = T_world_curr_ * T_prev_curr;
@@ -142,7 +175,7 @@ private:
     geometry_msgs::msg::PoseStamped ps;
     ps.header.frame_id = world_frame_;
     ps.header.stamp = msg->header.stamp;
-    matToPose(T_world_curr_, ps.pose);
+    matToPoseSE2(T_world_curr_, ps.pose);
 
     path_msg_.header.frame_id = world_frame_;
     path_msg_.header.stamp = ps.header.stamp;
@@ -220,6 +253,7 @@ private:
     pose.orientation.w = q.w();
   }
 
+  // 将 4x4 变换矩阵转换为 TF
   static geometry_msgs::msg::TransformStamped
   eigMatToTf(const Eigen::Matrix4f &T, const std::string &parent, const std::string &child,
            const rclcpp::Time &stamp)
@@ -243,6 +277,7 @@ private:
     return tf;
   }
 
+  // ICP 算法
   Eigen::Matrix4f runICP(const CloudT::Ptr & source,
                        const CloudT::Ptr & target,
                        CloudT *aligned_out,
@@ -259,6 +294,7 @@ private:
     icp.setTransformationEpsilon(trans_eps);
     icp.setEuclideanFitnessEpsilon(fit_eps);
 
+    //创建临时点云存储对齐结果
     CloudT aligned_tmp;
     icp.align(aligned_tmp);
 
@@ -283,7 +319,7 @@ private:
     
     ps.header.stamp = stamp;
     ps.header.frame_id = "rslidar"; // 这里简单用点云 frame，当作“世界”坐标系
-    matToPose(T_world_curr, ps.pose);
+    matToPoseSE2(T_world_curr, ps.pose);
 
     //发布单帧 pose
     pub_pose_->publish(ps);
@@ -294,6 +330,83 @@ private:
     pub_path_->publish(path_msg_);
   }
 
+  // 3.1 高度窗口 + 体素下采样（curr/prev 都要一致）
+  CloudT::Ptr filterCloud(const CloudT::Ptr& in, float leaf, double zmin, double zmax) {
+    // z 高度窗口
+    pcl::PassThrough<pcl::PointXYZ> pass;
+    pass.setInputCloud(in);
+    pass.setFilterFieldName("z");
+    pass.setFilterLimits(static_cast<float>(zmin), static_cast<float>(zmax));
+    CloudT::Ptr zf(new CloudT);
+    pass.filter(*zf);
+
+    // 体素
+    pcl::VoxelGrid<pcl::PointXYZ> vg;
+    vg.setInputCloud(zf);
+    vg.setLeafSize(leaf, leaf, leaf);
+    CloudT::Ptr out(new CloudT);
+    vg.filter(*out);
+    return out;
+  }
+
+
+  // 3.2 （可选）对点云的 z 做缩放（z 降权）
+  void scaleCloudZ(CloudT::Ptr& cloud, float scale) {
+    for (auto& p : cloud->points) p.z *= scale;
+  }
+
+  // 3.3 把 4x4 位姿投影到 SE(2)：仅保留 yaw & xy，清零 z/roll/pitch
+  void projectToSE2(Eigen::Matrix4f& T) {
+    Eigen::Matrix3f R = T.block<3,3>(0,0);
+    float yaw = std::atan2(R(1,0), R(0,0));
+    Eigen::Matrix3f Rz = Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+    T.block<3,3>(0,0) = Rz;
+    T(2,3) = 0.0f;
+  }
+
+
+  // 将 4x4 变换矩阵（已近似平面）转为 Pose（z=0 + 纯 yaw）
+  static void matToPoseSE2(const Eigen::Matrix4f& T, geometry_msgs::msg::Pose& pose) {
+    // 位置
+    pose.position.x = T(0,3);
+    pose.position.y = T(1,3);
+    pose.position.z = 0.0;  // 固定为 0
+
+    // 纯 yaw
+    Eigen::Matrix3f R = T.block<3,3>(0,0);
+    float yaw = std::atan2(R(1,0), R(0,0));
+    Eigen::Quaternionf q(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()));
+    q.normalize();
+    pose.orientation.x = q.x();
+    pose.orientation.y = q.y();
+    pose.orientation.z = q.z();
+    pose.orientation.w = q.w();
+  }
+
+  // 生成 TF（z=0 + 纯 yaw）
+  static geometry_msgs::msg::TransformStamped
+  eigMatToTfSE2(const Eigen::Matrix4f& T, const std::string& parent, const std::string& child,
+                const rclcpp::Time& stamp) {
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp = stamp;
+    tf.header.frame_id = parent;
+    tf.child_frame_id  = child;
+
+    tf.transform.translation.x = T(0,3);
+    tf.transform.translation.y = T(1,3);
+    tf.transform.translation.z = 0.0;  // 固定为 0
+
+    Eigen::Matrix3f R = T.block<3,3>(0,0);
+    float yaw = std::atan2(R(1,0), R(0,0));
+    Eigen::Quaternionf q(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()));
+    q.normalize();
+    tf.transform.rotation.x = q.x();
+    tf.transform.rotation.y = q.y();
+    tf.transform.rotation.z = q.z();
+    tf.transform.rotation.w = q.w();
+    return tf;
+  }
+
 private:
   // 参数
   double leaf_size_;
@@ -301,6 +414,11 @@ private:
   int    max_iter_;
   double trans_eps_;
   double euclid_fitness_eps_;
+
+  double z_min_ = -1.5, z_max_ = 1.5;
+  bool   use_z_weight_ = false;
+  double z_weight_ = 0.10;
+
 
   // 订阅 / 发布
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
