@@ -18,6 +18,10 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
+#include <thread>  
+#include <fast_gicp/gicp/fast_gicp.hpp>
+#include <fast_gicp/gicp/fast_vgicp.hpp>
+
 
 namespace ph = std::placeholders;
 
@@ -286,27 +290,30 @@ private:
                        double trans_eps,
                        double fit_eps)
   {
-    pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
-    icp.setInputSource(source);
-    icp.setInputTarget(target);
-    icp.setMaxCorrespondenceDistance(max_corr);
-    icp.setMaximumIterations(max_iter);
-    icp.setTransformationEpsilon(trans_eps);
-    icp.setEuclideanFitnessEpsilon(fit_eps);
+    //pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+    fast_gicp::FastVGICP<pcl::PointXYZ, pcl::PointXYZ> gicp;
+    gicp.setInputSource(source);
+    gicp.setInputTarget(target);
+    gicp.setNumThreads(4);                // 多线程加速
+    gicp.setMaxCorrespondenceDistance(max_corr);
+    gicp.setMaximumIterations(max_iter);
+    gicp.setTransformationEpsilon(trans_eps);
+    gicp.setEuclideanFitnessEpsilon(fit_eps);
+
 
     //创建临时点云存储对齐结果
     CloudT aligned_tmp;
-    icp.align(aligned_tmp);
+    gicp.align(aligned_tmp);
 
     if (aligned_out) {
       *aligned_out = aligned_tmp;
     }
 
-    if (!icp.hasConverged()) {
-      throw std::runtime_error("ICP did not converge");
+    if (!gicp.hasConverged()) {
+      throw std::runtime_error("FastVGICP did not converge");
     }
 
-    return icp.getFinalTransformation();
+    return gicp.getFinalTransformation();
   }
 
 
@@ -318,7 +325,7 @@ private:
     geometry_msgs::msg::PoseStamped ps;
     
     ps.header.stamp = stamp;
-    ps.header.frame_id = "rslidar"; // 这里简单用点云 frame，当作“世界”坐标系
+    ps.header.frame_id = frame_id; // 这里简单用点云 frame，当作“世界”坐标系
     matToPoseSE2(T_world_curr, ps.pose);
 
     //发布单帧 pose

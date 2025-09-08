@@ -28,6 +28,10 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(Eigen3 REQUIRED) 
 
+find_package(fast_gicp REQUIRED)
+message(STATUS "fast_gicp_INCLUDE_DIRS=${fast_gicp_INCLUDE_DIRS}")
+message(STATUS "fast_gicp_LIBRARIES=${fast_gicp_LIBRARIES}")
+
 #find_package(port_msgs REQUIRED)         # 车辆状态
 #find_package(chcnv_cgi_msgs REQUIRED)    # Devpvt
 
@@ -67,8 +71,14 @@ ament_target_dependencies(icp_node
 
 include_directories(${PCL_INCLUDE_DIRS})
 
+if(DEFINED fast_gicp_INCLUDE_DIRS)
+  target_include_directories(icp_node SYSTEM PUBLIC ${fast_gicp_INCLUDE_DIRS})
+  target_include_directories(icp_node SYSTEM PUBLIC ${PCL_INCLUDE_DIRS})
+endif()
+
 target_link_libraries(icp_node
   ${PCL_LIBRARIES}
+  ${fast_gicp_LIBRARIES}
   Eigen3::Eigen
 )
 
