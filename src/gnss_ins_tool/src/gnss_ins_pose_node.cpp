@@ -9,6 +9,10 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <tf2_ros/transform_broadcaster.h>
 
+#include <GeographicLib/UTMUPS.hpp>  // UTM
+#include <cmath>
+#include <memory>
+
 // 自定义消息
 #include <chcnv_cgi_msgs/msg/hcinspvatzcb.hpp>
 
@@ -56,6 +60,7 @@ public:
     map_frame_id_            = declare_parameter<std::string>("map_frame_id", "map");//地图坐标系id
     base_frame_id_           = declare_parameter<std::string>("base_frame_id", "base_link");//机体坐标系id
     publish_tf_              = declare_parameter<bool>("publish_tf", true);//是否发布TF变换
+    use_utm_                 = declare_parameter<bool>("use_utm", false);//是否使用UTM坐标系
 
     //预设原点的经纬度和高度
     origin_lat_ = declare_parameter<double>("origin_lat", 0.0);  
@@ -64,14 +69,24 @@ public:
 
     //不使用首次定位作为原点，转换为ECEF坐标
     if (!use_first_fix_as_origin_) {
-      origin_set_ = true;
-      origin_lat_rad_ = deg2rad(origin_lat_);
-      origin_lon_rad_ = deg2rad(origin_lon_);
-      geo::geodeticToECEF(origin_lat_rad_, origin_lon_rad_, origin_alt_,
-                          x0_ecef_, y0_ecef_, z0_ecef_);
-      RCLCPP_INFO(get_logger(), "Using fixed origin (%.8f, %.8f, %.3f m).",
-                  origin_lat_, origin_lon_, origin_alt_);
+        if (use_utm_) {//如果使用UTM坐标系
+        int z; bool n;
+        double e, nn;
+        GeographicLib::UTMUPS::Forward(origin_lat_, origin_lon_, z, n, e, nn);
+        utm_zone_ = z; utm_northp_ = n; e0_ = e; n0_ = nn; u0_ = origin_alt_;
+        origin_set_ = true;
+        RCLCPP_INFO(get_logger(), "[UTM] Fixed origin: zone=%d %s  E0=%.3f N0=%.3f H0=%.3f",
+                    utm_zone_, utm_northp_?"N":"S", e0_, n0_, u0_);
+        } else {
+        origin_set_ = true;
+        origin_lat_rad_ = deg2rad(origin_lat_);
+        origin_lon_rad_ = deg2rad(origin_lon_);
+        geo::geodeticToECEF(origin_lat_rad_, origin_lon_rad_, origin_alt_,
+                            x0_ecef_, y0_ecef_, z0_ecef_);
+        RCLCPP_INFO(get_logger(), "Using fixed origin (%.8f, %.8f, %.3f m).",
+                    origin_lat_, origin_lon_, origin_alt_);
     }
+  }
 
     // 发布者
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("/gnss_ins/pose", 10);
@@ -86,7 +101,8 @@ public:
 
     path_msg_.header.frame_id = map_frame_id_;
 
-    RCLCPP_INFO(get_logger(), "Gnss_ins_pose node started. Subscribing: %s", sub_->get_topic_name()); 
+    RCLCPP_INFO(get_logger(), "Gnss_ins_pose node started. Subscribing: %s mode=%s", 
+        sub_->get_topic_name(),use_utm_?"UTM":"ENU"); 
   }
 
 private:
@@ -96,22 +112,55 @@ private:
     const double lon_rad = deg2rad(msg->longitude);
     const double alt     = static_cast<double>(msg->altitude);
 
-    // 2) 原点初始化（首次有效定位）
-    if (!origin_set_) {
-      origin_set_ = true;
-      origin_lat_rad_ = lat_rad;
-      origin_lon_rad_ = lon_rad;
-      //原点转换为ECEF坐标
-      geo::geodeticToECEF(origin_lat_rad_, origin_lon_rad_, alt,
-                          x0_ecef_, y0_ecef_, z0_ecef_);
-      RCLCPP_INFO(get_logger(), "Origin set to first fix: lat=%.8f lon=%.8f alt=%.3f",
-                  msg->latitude, msg->longitude, msg->altitude);
-    }
+    double px = 0;
+    double py = 0;
+    double pz = 0;
 
-    // 3) WGS84 -> ENU
-    double x, y, z, e, n, u;
-    geo::geodeticToECEF(lat_rad, lon_rad, alt, x, y, z);
-    geo::ecefToENU(x, y, z, x0_ecef_, y0_ecef_, z0_ecef_, origin_lat_rad_, origin_lon_rad_, e, n, u);
+    if (use_utm_) {
+      // ----- UTM 模式 -----
+      int zone; 
+      bool northp;
+      double easting, northing;
+      GeographicLib::UTMUPS::Forward(msg->latitude, msg->longitude,
+                                     zone, northp, easting, northing); // 输入度
+
+      if (!origin_set_) {
+        origin_set_ = true;
+        utm_zone_ = zone; 
+        utm_northp_ = northp;
+        e0_ = easting; 
+        n0_ = northing; 
+        u0_ = alt;
+        RCLCPP_INFO(get_logger(), "[UTM] Origin set from first fix: zone=%d %s  E0=%.3f N0=%.3f H0=%.3f",
+                    utm_zone_, utm_northp_?"N":"S", e0_, n0_, u0_);
+      } else if (zone != utm_zone_ || northp != utm_northp_) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *this->get_clock(), 3000,
+          "UTM zone changed (old %d%s -> new %d%s). Using old zone origin.",
+          utm_zone_, utm_northp_?"N":"S", zone, northp?"N":"S");
+      }
+      
+      px = easting  - e0_;
+      py = northing - n0_;
+      pz = alt      - u0_;
+    }
+    else {
+      // ----- ENU 模式 -----
+      if (!origin_set_) {// 2) 原点初始化（首次有效定位）
+        origin_set_ = true;
+        origin_lat_rad_ = lat_rad;
+        origin_lon_rad_ = lon_rad;
+        //原点转换为ECEF坐标
+        geo::geodeticToECEF(origin_lat_rad_, origin_lon_rad_, alt, x0_ecef_, y0_ecef_, z0_ecef_);
+        RCLCPP_INFO(get_logger(), "[ENU] Origin set from first fix: lat=%.8f lon=%.8f alt=%.3f",
+                    msg->latitude, msg->longitude, msg->altitude);
+      }
+      // 3) WGS84 -> ECEF -> ENU or UTM
+      double x, y, z;
+      geo::geodeticToECEF(lat_rad, lon_rad, alt, x, y, z);
+      double e, n, u;
+      geo::ecefToENU(x, y, z, x0_ecef_, y0_ecef_, z0_ecef_, origin_lat_rad_, origin_lon_rad_, e, n, u);
+      px = e; py = n; pz = u;
+    }
 
     // 4) 姿态：roll/pitch/yaw 从角度制转为弧度制，并处理“航向定义”差异
     double roll  = deg2rad(msg->roll);
@@ -131,11 +180,11 @@ private:
 
     // 5) 发布 PoseStamped
     geometry_msgs::msg::PoseStamped ps;
-    ps.header = msg->header;
+    ps.header.stamp = this->now();
     ps.header.frame_id = map_frame_id_;
-    ps.pose.position.x = e;
-    ps.pose.position.y = n;
-    ps.pose.position.z = u;
+    ps.pose.position.x = px;
+    ps.pose.position.y = py;
+    ps.pose.position.z = pz;
     ps.pose.orientation = q_msg;
     pose_pub_->publish(ps);
 
@@ -169,7 +218,7 @@ private:
     odom_pub_->publish(odom);
 
     // 7) Path（可视化轨迹）
-    path_msg_.header.stamp = ps.header.stamp;
+    path_msg_.header.stamp = this->now();
     path_msg_.poses.push_back(ps);
     path_pub_->publish(path_msg_);
 
@@ -178,9 +227,9 @@ private:
       geometry_msgs::msg::TransformStamped tf;
       tf.header = ps.header;
       tf.child_frame_id = base_frame_id_;
-      tf.transform.translation.x = e;
-      tf.transform.translation.y = n;
-      tf.transform.translation.z = u;
+      tf.transform.translation.x = px;
+      tf.transform.translation.y = py;
+      tf.transform.translation.z = pz;
       tf.transform.rotation = q_msg;
       tf_broadcaster_->sendTransform(tf);
     }
@@ -189,17 +238,23 @@ private:
   static inline double deg2rad(double d){ return d * M_PI / 180.0; }
 
   // 参数/状态
+  bool use_utm_{false};
   bool use_first_fix_as_origin_{true};
   bool heading_is_from_north_{true};
   bool publish_tf_{true};
   bool origin_set_{false};
   std::string map_frame_id_{"map"};
   std::string base_frame_id_{"base_link"};
+  //ENU原点
   double origin_lat_{0.0}, origin_lon_{0.0}, origin_alt_{0.0};
   double origin_lat_rad_{0.0}, origin_lon_rad_{0.0};
   double x0_ecef_{0.0}, y0_ecef_{0.0}, z0_ecef_{0.0};
+  //UTM原点
+  int utm_zone_{0};
+  bool utm_northp_{true};
+  double e0_{0.0}, n0_{0.0}, u0_{0.0};
 
-  // ROS 通道
+  // ROS IO
   rclcpp::Subscription<chcnv_cgi_msgs::msg::Hcinspvatzcb>::SharedPtr sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
@@ -209,7 +264,8 @@ private:
   nav_msgs::msg::Path path_msg_;
 };
 
-int main(int argc, char** argv){
+int main(int argc, char** argv)
+{
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<GnssInsPoseNode>());
   rclcpp::shutdown();
