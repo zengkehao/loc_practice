@@ -11,7 +11,6 @@
 #include <optional>
 
 #include <chcnv_cgi_msgs/msg/hcinspvatzcb.hpp>
-#include <sensor_msgs/msg/imu.hpp>
 
 using MsgT = chcnv_cgi_msgs::msg::Hcinspvatzcb;
 
@@ -21,13 +20,11 @@ public:
     // ------------ 参数 ------------
     frame_map_       = declare_parameter<std::string>("frame_map", "map");
     frame_base_      = declare_parameter<std::string>("frame_base", "base_link");
-    odom_topic_      = declare_parameter<std::string>("odom_topic", "/imu/odom");
-    path_topic_      = declare_parameter<std::string>("path_topic", "path");
+    odom_topic_      = declare_parameter<std::string>("odom_topic", "odom");
+    path_topic_      = declare_parameter<std::string>("path_topic", "/imu/path_predict");
     use_header_stamp_= declare_parameter<bool>("use_header_stamp", true);
-    publish_path_    = declare_parameter<bool>("publish_path", false);
+    publish_path_    = declare_parameter<bool>("publish_path", true);
     publish_tf_      = declare_parameter<bool>("publish_tf", false);
-    publish_imu_     = declare_parameter<bool>("publish_imu", true);
-    imu_topic_       = declare_parameter<std::string>("imu_topic", "imu/data");
 
     gyro_in_deg_     = declare_parameter<bool>("gyro_in_deg", true);     // raw_angular_velocity 单位
     acc_in_g_        = declare_parameter<bool>("acc_in_g",  true);       // vehicle_linear_acceleration_without_g 单位
@@ -36,14 +33,12 @@ public:
     max_dt_          = declare_parameter<double>("max_dt", 0.2);         // 防大间隔爆炸
     min_dt_          = declare_parameter<double>("min_dt", 1e-4);        // 防除零
 
-
     // 初始速度/姿态 可参数覆盖
     init_speed_xy_mps_= declare_parameter<double>("init_speed_xy_mps", 0.0);
 
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 10);
     if (publish_path_) path_pub_ = create_publisher<nav_msgs::msg::Path>(path_topic_, 10);
     if (publish_tf_) tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-    if (publish_imu_) imu_pub_ = create_publisher<sensor_msgs::msg::Imu>(imu_topic_, 50);
 
     sub_ = create_subscription<MsgT>(
       "/chcnav/devpvt", rclcpp::SensorDataQoS(),
@@ -102,11 +97,11 @@ private:
     }
     integrateAttitude(gyro, dt);
 
-    // ========== 2) 线加速度(有重力，机体系) -> 速度/位置 ==========
+    // ========== 2) 线加速度(去重力，机体系) -> 速度/位置 ==========
     Vec3 acc_body_gfree{
-      static_cast<double>(msg->vehicle_linear_acceleration.x),
-      static_cast<double>(msg->vehicle_linear_acceleration.y),
-      static_cast<double>(msg->vehicle_linear_acceleration.z)
+      static_cast<double>(msg->vehicle_linear_acceleration_without_g.x),
+      static_cast<double>(msg->vehicle_linear_acceleration_without_g.y),
+      static_cast<double>(msg->vehicle_linear_acceleration_without_g.z)
     };
     // 单位：g -> m/s^2
     if (acc_in_g_) {
@@ -116,7 +111,6 @@ private:
     }
     // 机体 -> ENU
     Vec3 acc_enu = rotateBodyToENU(acc_body_gfree, q_wb_);
-    last_acc_enu_ = acc_enu;
 
     // 速度、位置积分
     vel_.x += acc_enu.x * dt;
@@ -128,28 +122,7 @@ private:
     pos_.z += vel_.z * dt;
 
     // 发布
-    //publishAll(stamp);
-
-    // ---- Publish standard sensor_msgs/Imu (body frame) ----
-    if (publish_imu_ && imu_pub_) {      
-        sensor_msgs::msg::Imu imu;
-        imu.header.stamp = stamp;
-        imu.header.frame_id = frame_base_; // IMU 挂在机体坐标系
-        // 角速度：rad/s（上面已从 deg/s 转成了 rad/s）
-        imu.angular_velocity.x = gyro.x;
-        imu.angular_velocity.y = gyro.y;
-        imu.angular_velocity.z = gyro.z;
-        // 线加速度：m/s^2（使用含重力的 vehicle_linear_acceleration）
-        imu.linear_acceleration.x = acc_body_gfree.x;
-        imu.linear_acceleration.y = acc_body_gfree.y;
-        imu.linear_acceleration.z = acc_body_gfree.z;
-        // orientation 不从这里给（纯传感器输出），按规范置 -1
-        imu.orientation_covariance[0] = -1.0;
-        // 给个保守常数协方差（如你有更准的噪声，可调）
-        imu.angular_velocity_covariance[0] = imu.angular_velocity_covariance[4] = imu.angular_velocity_covariance[8] = 0.01;
-        imu.linear_acceleration_covariance[0] = imu.linear_acceleration_covariance[4] = imu.linear_acceleration_covariance[8] = 0.5;
-        imu_pub_->publish(imu);
-    }
+    publishAll(stamp);
   }
 
   void initFromMsg(const MsgT& m) {
@@ -210,7 +183,7 @@ private:
       dq.setZ(az * std::sin(half));
       dq.setW(std::cos(half));
     }
-    q_wb_ = q_wb_ * dq;
+    q_wb_ = dq * q_wb_;
     q_wb_.normalize();
   }
 
@@ -284,6 +257,7 @@ private:
     }
 
     if (publish_path_) {
+      if ((path_count_++ % path_stride_) == 0) {
       geometry_msgs::msg::PoseStamped p;
       p.header.stamp = stamp;
       p.header.frame_id = frame_map_;
@@ -292,8 +266,10 @@ private:
       p.pose.position.z = pos_.z;
       p.pose.orientation = tf2::toMsg(q_wb_);
       path_msg_.header.stamp = stamp;
+      path_msg_.header.frame_id = frame_map_;
       path_msg_.poses.push_back(p);
       path_pub_->publish(path_msg_);
+      }
     }
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
@@ -307,16 +283,15 @@ private:
   rclcpp::Subscription<MsgT>::SharedPtr sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
   // params
-  std::string frame_map_, frame_base_, odom_topic_, path_topic_,imu_topic_;
+  std::string frame_map_, frame_base_, odom_topic_, path_topic_;
   bool use_header_stamp_{true}, publish_path_{true}, publish_tf_{true};
   bool gyro_in_deg_{true}, acc_in_g_{true}, euler_in_deg_{true};
   double gravity_{9.80665}, max_dt_{0.2}, min_dt_{1e-4}, init_speed_xy_mps_{0.0};
-  bool publish_imu_;
-  nav_msgs::msg::Path path_msg_;
+  int path_stride_ = declare_parameter<int>("path_stride", 1); // 每隔 N 个点入 Path
+  int path_count_ = 0;
 
   // state
   tf2::Quaternion q_wb_;  // world(ENU) <- body
@@ -328,6 +303,8 @@ private:
   // ENU 原点
   LLA  lla_ref_{};
   ECEF ecef_ref_{};
+
+  nav_msgs::msg::Path path_msg_;
 };
   
 int main(int argc, char** argv) {

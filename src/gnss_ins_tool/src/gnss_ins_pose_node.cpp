@@ -59,8 +59,8 @@ public:
     heading_is_from_north_   = declare_parameter<bool>("heading_is_from_north", true);//航向角是否以正北为参考
     map_frame_id_            = declare_parameter<std::string>("map_frame_id", "map");//地图坐标系id
     base_frame_id_           = declare_parameter<std::string>("base_frame_id", "base_link");//机体坐标系id
-    publish_tf_              = declare_parameter<bool>("publish_tf", true);//是否发布TF变换
-    use_utm_                 = declare_parameter<bool>("use_utm", false);//是否使用UTM坐标系
+    publish_tf_              = declare_parameter<bool>("publish_tf", false);//是否发布TF变换
+    use_utm_                 = declare_parameter<bool>("use_utm", true);//是否使用UTM坐标系
 
     //预设原点的经纬度和高度
     origin_lat_ = declare_parameter<double>("origin_lat", 0.0);  
@@ -100,6 +100,7 @@ public:
       std::bind(&GnssInsPoseNode::callBack, this, std::placeholders::_1));
 
     path_msg_.header.frame_id = map_frame_id_;
+    path_msg_.poses.clear();
 
     RCLCPP_INFO(get_logger(), "Gnss_ins_pose node started. Subscribing: %s mode=%s", 
         sub_->get_topic_name(),use_utm_?"UTM":"ENU"); 
@@ -170,7 +171,7 @@ private:
     // 若 yaw 为“相对北的航向角（逆时针为正）”，需转换成 ENU 内部偏航（相对东轴）
     // ENU: x=East, y=North。若 heading 从北逆时针，则与 ENU yaw 关系为：yaw_enu = heading - 90°（即 -pi/2）
     if (heading_is_from_north_) {
-      yaw = yaw - M_PI_2; // -90 度
+      yaw = yaw + M_PI_2; // +90 度
     }
 
     // 以 ZYX (yaw-pitch-roll) 生成四元数（ENU，Z 轴朝上）
@@ -180,7 +181,7 @@ private:
 
     // 5) 发布 PoseStamped
     geometry_msgs::msg::PoseStamped ps;
-    ps.header.stamp = this->now();
+    ps.header.stamp = msg->header.stamp;
     ps.header.frame_id = map_frame_id_;
     ps.pose.position.x = px;
     ps.pose.position.y = py;
@@ -203,6 +204,12 @@ private:
       odom.pose.covariance[0]  = sx*sx; // xx
       odom.pose.covariance[7]  = sy*sy; // yy
       odom.pose.covariance[14] = sz*sz; // zz
+    }else {
+      // 默认值（米）
+      const double sx = 0.3, sy = 0.3, sz = 0.6;
+      odom.pose.covariance[0]  = sx*sx;
+      odom.pose.covariance[7]  = sy*sy;
+      odom.pose.covariance[14] = sz*sz;
     }
 
     // 姿态协方差：由 euler_stdev (deg) 近似到 rad^2，对角阵。
@@ -213,12 +220,23 @@ private:
       odom.pose.covariance[21] = sr*sr; // rr
       odom.pose.covariance[28] = sp*sp; // pp
       odom.pose.covariance[35] = sy*sy; // yy
+    }else {
+      // 默认值（度 -> 弧度）
+      const double sdeg = 2.0;
+      const double sr = deg2rad(sdeg), sp = deg2rad(sdeg), syaw = deg2rad(sdeg);
+      odom.pose.covariance[21] = sr*sr;
+      odom.pose.covariance[28] = sp*sp;
+      odom.pose.covariance[35] = syaw*syaw;
     }
 
     odom_pub_->publish(odom);
 
-    // 7) Path（可视化轨迹）
-    path_msg_.header.stamp = this->now();
+    // 7) 追加到 Path 并发布
+    ps.header = odom.header;
+    ps.header.frame_id = map_frame_id_;
+    ps.pose = odom.pose.pose;
+
+    path_msg_.header.stamp = odom.header.stamp;  // Path 的时间戳跟随最新 Odom
     path_msg_.poses.push_back(ps);
     path_pub_->publish(path_msg_);
 
